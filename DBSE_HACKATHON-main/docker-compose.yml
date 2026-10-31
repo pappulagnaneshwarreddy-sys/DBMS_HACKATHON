@@ -1,0 +1,180 @@
+services:
+  # ============================================================================
+  # 1. PostgreSQL with pgvector: Core Relational Database & Source of Truth
+  # NOTE: Strictly bound to 127.0.0.1. NEVER exposed to external LAN Wi-Fi network.
+  # ============================================================================
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: relieflink-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-relieflink_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-relieflink_dev_password_change_in_prod}
+      POSTGRES_DB: ${POSTGRES_DB:-relieflink_db}
+    ports:
+      # Bound ONLY to local loopback (host inspection). Inaccessible from other Wi-Fi devices.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - ./database/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./database/postgres/seed_demo_data.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+      - relieflink_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-relieflink_admin} -d ${POSTGRES_DB:-relieflink_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - relieflink-net
+
+  # ============================================================================
+  # 2. MongoDB: Incident Intelligence & Field Metadata Store
+  # NOTE: Strictly bound to 127.0.0.1. NEVER exposed to external LAN Wi-Fi network.
+  # ============================================================================
+  mongo:
+    image: mongo:7.0
+    container_name: relieflink-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:-mongo_admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:-mongo_dev_password_change_in_prod}
+      MONGO_INITDB_DATABASE: ${MONGO_DB:-relieflink_intelligence}
+    ports:
+      # Bound ONLY to local loopback (host inspection). Inaccessible from other Wi-Fi devices.
+      - "127.0.0.1:${MONGO_PORT:-27017}:27017"
+    volumes:
+      - ./database/mongo/init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+      - relieflink_mongodata:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - relieflink-net
+
+  # ============================================================================
+  # 3. FastAPI Gateway: Central API & Server-Side RBAC
+  # Bound to 0.0.0.0:8000 to serve API calls from all laptops on LAN
+  # ============================================================================
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: relieflink-gateway
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:${GATEWAY_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-relieflink_admin}:${POSTGRES_PASSWORD:-relieflink_dev_password_change_in_prod}@postgres:5432/${POSTGRES_DB:-relieflink_db}
+      MONGO_URI: mongodb://${MONGO_INITDB_ROOT_USERNAME:-mongo_admin}:${MONGO_INITDB_ROOT_PASSWORD:-mongo_dev_password_change_in_prod}@mongo:27017/${MONGO_DB:-relieflink_intelligence}?authSource=admin
+      JWT_SECRET: ${JWT_SECRET:-super_secret_jwt_key_hackathon_demo_2026_change_in_production}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      INVENTORY_SERVICE_URL: http://inventory-spring:8081
+      SIMULATOR_SERVICE_URL: http://simulator-node:5001
+      INTERNAL_SERVICE_KEY: ${INTERNAL_SERVICE_KEY:-relieflink_internal_mesh_token_2026}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    networks:
+      - relieflink-net
+
+  # ============================================================================
+  # 4. Spring Boot Inventory Microservice (Internal mesh only)
+  # Communicated with by FastAPI Gateway over Docker internal network
+  # ============================================================================
+  inventory-spring:
+    build:
+      context: ./services/inventory-spring
+      dockerfile: Dockerfile
+    container_name: relieflink-inventory-spring
+    restart: unless-stopped
+    expose:
+      - "8081"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-relieflink_db}
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-relieflink_admin}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-relieflink_dev_password_change_in_prod}
+      INTERNAL_SERVICE_KEY: ${INTERNAL_SERVICE_KEY:-relieflink_internal_mesh_token_2026}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - relieflink-net
+
+  # ============================================================================
+  # 5. Node.js Disaster Simulator Microservice (WebSocket & REST Events)
+  # Bound to 0.0.0.0:5001 to stream Socket.IO events to all laptops on LAN
+  # ============================================================================
+  simulator-node:
+    build:
+      context: ./services/simulator-node
+      dockerfile: Dockerfile
+    container_name: relieflink-simulator-node
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:${SIMULATOR_SERVICE_PORT:-5001}:5001"
+    environment:
+      PORT: 5001
+      GATEWAY_URL: http://gateway:8000
+      INTERNAL_SERVICE_KEY: ${INTERNAL_SERVICE_KEY:-relieflink_internal_mesh_token_2026}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:5001/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      gateway:
+        condition: service_healthy
+    networks:
+      - relieflink-net
+
+  # ============================================================================
+  # 6. React + TypeScript Frontend
+  # Bound to 0.0.0.0:5173 to serve the 4 Role UI to all laptops over local Wi-Fi
+  # ============================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: relieflink-frontend
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:${FRONTEND_PORT:-5173}:80"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      gateway:
+        condition: service_healthy
+    networks:
+      - relieflink-net
+
+volumes:
+  relieflink_pgdata:
+    driver: local
+  relieflink_mongodata:
+    driver: local
+
+networks:
+  relieflink-net:
+    driver: bridge
